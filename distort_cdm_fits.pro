@@ -301,10 +301,46 @@ end
   
 
 
-FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readout_image_time, readout_store_time, readout_serial_time, trap_species_parallel, trap_species_image_density, trap_species_store_density, trap_species_serial, trap_species_serial_density, charge_injection_flag, charge_injection_time_gap, store_section_lines, ci_losses_pixel_species_image, release_image_time, release_store_time, release_serial_time, ci_released_image_pixel, capture_cross_section_image, charge_volume_coeff_image, capture_cross_section_store, charge_volume_coeff_store, capture_cross_section_serial, charge_volume_coeff_serial, flag_retrapping, flag_iteration, iter_max, threshold,  short_bernoulli, long_bernoulli, flag_binomial, rawymax, serialL, readout_nodes, serial_columns, ci_losses_pixel_species_store
+FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readout_image_time, readout_store_time, readout_serial_time, trap_species_parallel, trap_species_image_density, trap_species_storeA_density, trap_species_storeB_density, trap_species_serial, trap_species_serial_density, charge_injection_flag, charge_injection_time_gap, image_section_lines, store_section_lines, ccd_mode_binning, ci_losses_pixel_species_image, release_image_time, release_store_time, release_serial_time, ci_released_image_pixel, capture_cross_section_image, charge_volume_coeff_image, capture_cross_section_store, charge_volume_coeff_store, capture_cross_section_serial, charge_volume_coeff_serial, flag_retrapping, flag_iteration, iter_max, threshold,  short_bernoulli, long_bernoulli, flag_binomial, flag_same_pixel_release, rawymax, serialL, readout_nodes, serial_columns, ci_losses_pixel_species_storeA, ci_losses_pixel_species_storeB
 
+;;; rawx = Binned X column detector position
+;;; rawy = Binned Y row detector position.
+;;;
+  ;;; HISTORY 
+  ;;; 26 MAY 2021 - Function updated implementing 2-phases store
+  ;;;               transfer
+  ;;; Updated needed after realising store transfer is more complex
+  ;;; than what has been implemented.
+  ;;; During the first phase, parallel transfer period is binning x
+  ;;; image_period (6x27us at this time)
+  ;;; During second phase, parallel transfer period is at (386 *
+  ;;; store_frequency)
+  ;;; The number of transfers during Phase A and B is determined by
+  ;;; rawy. If rawy = 1 then the line will be transferred thru the
+  ;;; entire store section during Phase A.
+  ;;; If rawy = 3791 Phase A will only last for 85 overscans
+  ;;; used to fill the store area, the rest with Phase B 
+  ;;;
+  ;;;
+  ;;;
   ;;; ****** Image section parallel CTI damage ******
 
+       ;;; Set-up lenght of the two phases of store parallel readout
+  overscan_lines = 85 ; Overscan lines from image to store to completly fill out all store area before store readout.
+  overscan_cols = 10  ; Overscan pixels in serial readout
+  image_to_store_top_line = round((image_section_lines)/6) ; This corresponds to 632 if image lines is equal to 3791.
+  store_phaseA_lines = overscan_lines + round((image_section_lines - rawy*ccd_mode_binning)/6)
+  store_phaseB_lines = store_section_lines - store_phaseA_lines
+  serial_binned_transfers = round((serial_columns/ccd_mode_binning)/readout_nodes) + overscan_cols
+
+  input_flux_ele = total(xray_unbinned_18cols*1000./3.65)
+  full_store_readout = store_section_lines* serial_binned_transfers*readout_store_time ;;; This is the time it takes the store area to be read out after all the lines of the image + 85 overscan lines have been moved to it.
+          
+  ;print, 'T density image ',trap_species_image_density
+  ;print, 'T density store ',trap_species_storeA_density
+  ;print, 'T density storeB ',trap_species_storeB_density
+  ;print, 'T density serial ',trap_species_serial_density        
+          
      ;;; pCTI in image section if X-ray event not at bottom of image section
      if rawy gt 0 then begin
 ;        if tab[event_index].RAWY gt 1 then continue
@@ -321,9 +357,18 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
            ;;; If CI in ON, update the trap_density by adding the
            ;;; released electrons after CI capture.
            if charge_injection_flag then begin
-              ; 1 - Evaluate time from CI transit to X-ray event
-              time_interval = charge_injection_time_gap + readout_image_time * (rawy * 6 + store_section_lines)
-                                ; 2 - Evaluate amount of trapped CI
+                                ; 1 - Evaluate time gap from CI
+                                ;     transit to X-ray event
+              ;;; This time is equal to
+              ;;; CI transfer from rowY to 0 +
+              ;;; CI transfer from 719 to 632 at rate of 27us*6 (store phaseA)+
+              ;;; Full store readout +
+              ;;; EDU time
+              ;;; This time is the same for all pixels below rowY, as
+              ;;; the time trafer for CI from Y to Y-1 and the X-ray
+              ;;; from Y to Y-1 is the same and they cancel out.
+              time_interval = charge_injection_time_gap + full_store_readout  + overscan_lines * 1.0 * readout_image_time + readout_image_time * rawy * ccd_mode_binning
+                                              ; 2 - Evaluate amount of trapped CI
                                 ;     released e- by time_interval
                                 ;                 for a pixel
               ci_released_image_pixel = ci_losses_pixel_species_image[speciesIndex] * (1. - exp(-time_interval/release_image_time[speciesIndex]))
@@ -342,11 +387,12 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
            ;;; correctly filled with zeros.
            if nFlux gt 0 then begin
               flux_input_electrons = xray_unbinned_18cols[columnIndex, *]*1000./3.65
-              xray_unbinned_18cols_pcti_image[columnIndex, *] = cdm_process(flux_input_electrons, readout_time, trap_density, release_image_time, capture_cross_section_image, charge_volume_coeff_image, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial)
+              xray_unbinned_18cols_pcti_image[columnIndex, *] = cdm_process(flux_input_electrons, readout_time, trap_density, release_image_time, capture_cross_section_image, charge_volume_coeff_image, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial, flag_same_pixel_release = flag_same_pixel_release)
            endif 
         ;stop
         endfor
 
+        
      ;;; ****** Bin the lines at the start of the store section.*****
 
      ;;; Initialise output binned array
@@ -359,7 +405,7 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
            endfor
         endfor
 
-     
+    
      ;;; ******** Store section parallel CTI damage   *******
 
      ;;; 1- Set up CTI transfer parameters and arrays.
@@ -373,7 +419,12 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
      ;;;        this transfer. Only lines with charge at locations
      ;;;        below the X-ray event line need to be
      ;;;        processed. All lines above are not stored
+     ;;;
+     ;;; Update 26 May 2021
+     ;;; Implement the 2 phase readout.
 
+       
+     ;;; STORE PARALLEL TRANSFER
         
         xray_binned_18cols_store_input = dblarr(18, store_section_lines+3)
      ;;; Populate the 3 virtual lines at the top of the store section with charge from the pCTI
@@ -395,40 +446,70 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
      ;;; Y-binning
         for columnIndex = 0, 17 do begin
            for rawy_index = 0, 2 do begin
-              xray_binned_18cols_store_input[columnIndex,store_section_lines+rawy_index] = total(xray_unbinned_18cols[columnIndex,rawy_index*6 : (rawy_index+1)*6-1])*1000./3.65
+;              xray_binned_18cols_store_input[columnIndex,store_phaseA_lines+rawy_index] = total(xray_unbinned_18cols[columnIndex,rawy_index*6 : (rawy_index+1)*6-1])*1000./3.65
+               xray_binned_18cols_store_input[columnIndex,store_section_lines+rawy_index] = total(xray_unbinned_18cols[columnIndex,rawy_index*6 : (rawy_index+1)*6-1])*1000./3.65 
            endfor
         endfor
      endelse
+
+     total_image_pcti = total(xray_binned_18cols_store_input)
+     losses_image_pcti = input_flux_ele - total_image_pcti
      
      xray_binned_18cols_pcti_store = dblarr(18, store_section_lines+3)
-     readout_time = dblarr(store_section_lines+3) +readout_store_time
+     ;;; Readout time at two rates:
+     ;;; Part A - Transfer period of 27us * 6
+     ;;; Part B - Transfer period of 7.14us * 386 
+     readout_time = dblarr(store_section_lines+3)
+     readout_time[0:store_phaseA_lines+2] = readout_store_time*6
+     readout_time[store_phaseA_lines+3: store_section_lines-1] = readout_serial_time * serial_binned_transfers
      ;;; Note - When CI is implemented the trap density will need to
      ;;;        be updated with the trap stats after CI charge
      ;;;        transfer, using for example an effective trap density
      ;;;        equal to the trap density of empty traps.
      trap_density = dblarr(store_section_lines+3, trap_species_parallel)
      for speciesIndex = 0, trap_species_parallel-1 do begin
-        trap_density[*, speciesIndex] = trap_species_store_density[speciesIndex]
+        trap_density[0:store_phaseA_lines+2, speciesIndex] = trap_species_storeA_density[speciesIndex]
+        trap_density[store_phaseA_lines+3: store_section_lines-1, speciesIndex] = trap_species_storeB_density[speciesIndex]
 
         ;;; If CI in ON, update the trap_density by adding the
         ;; released electrons after CI capture.
         if charge_injection_flag then begin
-              ; 1 - Evaluate time from CI transit to X-ray even
-           time_interval = charge_injection_time_gap + readout_image_time * (rawy * 6 + store_section_lines)
+                                ; 1 - Evaluate time from CI transit to X-ray event
+           ;;; Updated on 28/5/2021 to implement CI at top of image
+           ;;; readout at the same time of image readout.
+           ;;; The time gap between CI line and X-rays in the
+           ;;; following image in 3 regimes.
+           ;;; rawy = xray location
+           ;;; sy = pixel location in the store section
+           ;;; 1 - sy > 632 (3719/binning = image_to_store_top_line)
+           ;;; 2 - rawy/b < sy < 632
+           ;;; 3 - sy < rawy/6
+           ;;;
+
+           time_interval = dblarr(store_section_lines+3)
+           for sy = 0, store_section_lines+2 do begin
+              if sy ge image_to_store_top_line then time_interval[sy] = (store_section_lines * 1.0 - round(image_section_lines/ccd_mode_binning) *1.0) * readout_image_time * ccd_mode_binning + round(image_section_lines/ccd_mode_binning) * 1.0 * readout_store_time * serial_binned_transfers + rawy * readout_image_time + charge_injection_time_gap
+              if sy gt round(rawy/ccd_mode_binning) and sy lt image_to_store_top_line then time_interval[sy] = rawy * 1.0 * readout_image_time + sy * 1.0 * serial_binned_transfers * readout_store_time + (store_section_lines * 1.0 - sy) * readout_image_time * ccd_mode_binning + charge_injection_time_gap
+              if sy le round(rawy/ccd_mode_binning) then time_interval[sy] = round(rawy * 1.0 /ccd_mode_binning) * serial_binned_transfers *  readout_store_time + rawy * 1.0 * readout_image_time + (store_section_lines*1.0 - round(rawy * 1.0 /ccd_mode_binning)*1.0) * readout_image_time * ccd_mode_binning * 1.0 + charge_injection_time_gap
+           endfor
                                 ; 2 - Evaluate amount of released e-
                                 ;     by time_interval
-           ci_released_store = ci_losses_pixel_species_store[speciesIndex] * (1. - exp(-time_interval/release_store_time[speciesIndex]))
+           ci_released_storeA = ci_losses_pixel_species_storeA[speciesIndex] * (1. - exp(-time_interval/release_store_time[speciesIndex]))
+           ci_released_storeB = ci_losses_pixel_species_storeB[speciesIndex] * (1. - exp(-time_interval/release_store_time[speciesIndex]))
               ; 3 - The released charge effectively frees traps
-           updated_density_value_species = trap_species_store_density[speciesIndex] + ci_released_store
-           trap_density[*, speciesIndex] = updated_density_value_species
-           ;stop
+           updated_densityA_value_species = trap_species_storeA_density[speciesIndex] + ci_released_storeA
+           updated_densityB_value_species = trap_species_storeA_density[speciesIndex] + ci_released_storeB
+           trap_density[0:store_phaseA_lines+2, speciesIndex] = updated_densityA_value_species[0:store_phaseA_lines+2]
+           trap_density[store_phaseA_lines+3: store_section_lines-1, speciesIndex] = updated_densityB_value_species[store_phaseA_lines+3: store_section_lines-1]           
         endif
                                 ;Set the density of the 3 virtual
-                                ;lines above the store section to to zero
+                                ;lines above the store section to zero
         trap_density[store_section_lines:store_section_lines+2, speciesIndex] = 0.0
      endfor
 
-     ;;; 2- Transfer of Y-binned 18*3 columns.
+     ;;; 2- Transfer of Y-binned 18*3 columns
+     ;;; The two phases with different readout speeds are combined by setting different readout_time values over the length of the store section.
+
      for columnIndex = 0, 17 do begin
         fluxSearch = where(xray_binned_18cols_store_input[columnIndex, *] gt 0., nFlux)
            ;;; Only call the distortion if flux in the column,
@@ -436,10 +517,10 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
            ;;; correctly filled with zeros.
         if nFlux gt 0 then begin
            flux_input_electrons = xray_binned_18cols_store_input[columnIndex, *]
-           xray_binned_18cols_pcti_store[columnIndex, *] = cdm_process(flux_input_electrons, readout_time, trap_density, release_store_time, capture_cross_section_store, charge_volume_coeff_store, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial)
+           xray_binned_18cols_pcti_store[columnIndex, *] = cdm_process(flux_input_electrons, readout_time, trap_density, release_store_time, capture_cross_section_store, charge_volume_coeff_store, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial, flag_same_pixel_release = flag_same_pixel_release)
         endif
      endfor
-     
+    
      ;;; ********* Serial CTI transfer   **********
 
      ;;; Apply the tranfer of the three binned lines relative to the
@@ -448,7 +529,7 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
      ;;; 1 - Setup the transfer, checkin the output node.
      
      ;Array to store indices of X-ray flux
-     event_index_start = rawx*6
+     event_index_start = rawx * ccd_mode_binning
      serial_line_preceding_in = dblarr(serialL)
      serial_line_central_in = dblarr(serialL)
      serial_line_following_in = dblarr(serialL)
@@ -482,6 +563,7 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
         serial_line_following_in[rawx*6+rawxIndex] = xray_binned_18cols_pcti_store[rawxIndex,store_section_lines+2] + total_ci_release[2]
      endfor
 
+    serial_lines_in = total(serial_line_preceding_in + serial_line_central_in + serial_line_following_in)
     ;;; Reformat the serial register to prepare for serial transfer
     ;;; based on node 1/2 readout and RAWX coordinate of the X-ray event
 
@@ -503,7 +585,7 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
 ;       event_index_start = length_sr - (rawx * 6 + 17 - serial_columns/2)
         event_index_start = serialL - 1 - (rawx * 6 + 17)
                                 ;store_event_index = length_sr - store_event_index
-        readout_time = dblarr(serialL- serial_columns/2) +readout_serial_time
+        readout_time = dblarr(serialL- serial_columns/2) + readout_serial_time/ccd_mode_binning
         trap_density = dblarr(serialL- serial_columns/2, trap_species_serial)
         for speciesIndex = 0, trap_species_serial-1 do begin
            trap_density[*, speciesIndex] = trap_species_serial_density[speciesIndex]
@@ -519,7 +601,7 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
         serial_line_central_in = serial_line_central_in[0: indexSerialArrayCut]
         serial_line_following_in = serial_line_following_in[0: indexSerialArrayCut]
 
-        readout_time = dblarr(indexSerialArrayCut+1) +readout_serial_time
+        readout_time = dblarr(indexSerialArrayCut+1) + readout_serial_time/ccd_mode_binning
         trap_density = dblarr(indexSerialArrayCut+1, trap_species_serial)
         for speciesIndex = 0, trap_species_serial-1 do begin
            trap_density[*, speciesIndex] = trap_species_serial_density[speciesIndex]
@@ -535,11 +617,11 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
      endif
                                 ; 2 - Serial transfer 
 
-     serial_line_preceding_serial_cti = cdm_process(serial_line_preceding_in, readout_time, trap_density, release_serial_time, capture_cross_section_serial, charge_volume_coeff_serial, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial)
+     serial_line_preceding_serial_cti = cdm_process(serial_line_preceding_in, readout_time, trap_density, release_serial_time, capture_cross_section_serial, charge_volume_coeff_serial, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial, flag_same_pixel_release = flag_same_pixel_release)
 
-     serial_line_central_serial_cti = cdm_process(serial_line_central_in, readout_time, trap_density, release_serial_time, capture_cross_section_serial, charge_volume_coeff_serial, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial)
+     serial_line_central_serial_cti = cdm_process(serial_line_central_in, readout_time, trap_density, release_serial_time, capture_cross_section_serial, charge_volume_coeff_serial, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial, flag_same_pixel_release = flag_same_pixel_release)
 
-     serial_line_following_serial_cti = cdm_process(serial_line_following_in, readout_time, trap_density, release_serial_time, capture_cross_section_serial, charge_volume_coeff_serial, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial)
+     serial_line_following_serial_cti = cdm_process(serial_line_following_in, readout_time, trap_density, release_serial_time, capture_cross_section_serial, charge_volume_coeff_serial, flag_retrapping = flag_retrapping, flag_iteration = flag_iteration, iter_max = iter_max, threshold = threshold, short_bernoulli = short_bernoulli, long_bernoulli = long_bernoulli, flag_binomial = flag_binomial, flag_same_pixel_release = flag_same_pixel_release)
 
      ;;; Initialise output damaged 9 pixel window array
      energy_grid_cdm = dblarr(9)
@@ -554,6 +636,12 @@ FUNCTION cdm_function, xray_unbinned_18cols, rawx, rawy, transfer_length, readou
         energy_grid_cdm[6:8] = [total(serial_line_preceding_serial_cti[event_index_start:event_index_start+5]), total(serial_line_preceding_serial_cti[event_index_start+6:event_index_start+11]), total(serial_line_preceding_serial_cti[event_index_start+12:event_index_start+17])]
      endelse
 
+  print, 'losses image parallel = ', losses_image_pcti
+  losses_store_pcti = total_image_pcti - serial_lines_in
+  print, 'losses store parallel = ', losses_store_pcti  
+  serial_cti_electrons = total(energy_grid_cdm)
+  losses_serial_cti = serial_lines_in - serial_cti_electrons
+  print, 'losses serial = ', losses_serial_cti
   ;;; Convert flux from electron to eV
   damaged_9pixels_array_ev = energy_grid_cdm*3.65
 
@@ -1198,6 +1286,8 @@ pro distort_cdm_fits, fits_filename, key_release = key_release, key_plot = key_p
 ;;;  
 ;;; Output: CTI distorted fits file
 ;;;  
+;;; EXAMPLE: distort_cdm_fits, 'BOL_events_200321_lines.FIT', DEBUG_FLAG=1 
+;;;
 ;;; HISTORY - Written by CP, 14 Aug 2020
 ;;;  
 ;;;           Modified from distort_cti_qdp_dety_min_max
@@ -1230,11 +1320,25 @@ pro distort_cdm_fits, fits_filename, key_release = key_release, key_plot = key_p
 ;;;          charge splitting and spreading needs to be applied. The
 ;;;          input data need to be a reformatted from the 10x10
 ;;;          central unbinned flux values.
+;;;
+;;;          CP, 26 MAY 2021 - cdm_function updated implementing 2-phases store
+;;;               transfer
+;;;          Updated needed after realising store transfer is more complex
+;;;          than what has been implemented.
+;;;          During the first phase, parallel transfer period is binning x
+;;;          image_period (6x27us at this time)
+;;;          During second phase, parallel transfer period is at (386 *
+;;;          store_frequency)
+;;;          The number of transfers during Phase A and B is determined by
+;;;          rawy. If rawy = 1 then the line will be transferred thru the
+;;;          entire store section during Phase A.
+;;;          If rawy = 3791 Phase A will only last for 85 overscans
+;;;          used to fill the store area, the rest with Phase B           
   
   
   if n_params() ne 1 then begin
-     print,"Please enter correct parameters: distort_cdm_fits, fits_filename"
-     print,"Please enter correct parameters: distort_cdm_fits, 'P100001SXI0033IMEVLI0000.FIT'"
+     print,"Please enter correct parameters: distort_cdm_fits, fits_filename, DEBUG_FLAG=1"
+     print,"Please enter correct parameters: distort_cdm_fits, 'P100001SXI0033IMEVLI0000.FIT', DEBUG_FLAG=1"
      return
   endif  
 
@@ -1252,6 +1356,8 @@ pro distort_cdm_fits, fits_filename, key_release = key_release, key_plot = key_p
   print, 'charge_injection_flag = ', charge_injection_flag
   print, 'capture_cross_section_image = ', capture_cross_section_image
   print, 'flag_unbinned = ', flag_unbinned
+  print, 'flag_same_pixel_release = ', flag_same_pixel_release
+  print, 'Charge volume coeff = ', charge_volume_coeff_image
 
   ;;; Output fits, ps, debug filenames
   splitString = strsplit(fits_filename, '.', /extract)
@@ -1275,12 +1381,19 @@ pro distort_cdm_fits, fits_filename, key_release = key_release, key_plot = key_p
   ;;; 
 
   if charge_injection_flag then begin
+     serial_binned_transfers = round((serial_columns/ccd_mode_binning)/readout_nodes) + overscan_cols  
      ci_losses_pixel_species_image = chargeInjectionFillingNLines(charge_injection_electrons, charge_injection_block_lines, readout_image_time, trap_species_image_density, capture_cross_section_image, charge_volume_coeff_image)
-     ci_losses_pixel_species_store = chargeInjectionFillingNLines(charge_injection_electrons, charge_injection_block_lines, readout_store_time, trap_species_store_density, capture_cross_section_store, charge_volume_coeff_store)
+     ci_losses_pixel_species_storeA = chargeInjectionFillingNLines(charge_injection_electrons, charge_injection_block_lines, readout_store_time*ccd_mode_binning, trap_species_store_density, capture_cross_section_store, charge_volume_coeff_store)
+     ci_losses_pixel_species_storeB = chargeInjectionFillingNLines(charge_injection_electrons, charge_injection_block_lines, readout_serial_time*serial_binned_transfers, trap_species_store_density, capture_cross_section_store, charge_volume_coeff_store)
+
      ; The effective density of traps is lowered by the captured electrons.
      trap_species_image_density = trap_species_image_density-ci_losses_pixel_species_image
-     trap_species_store_density = trap_species_store_density-ci_losses_pixel_species_store
-  endif
+     trap_species_storeA_density = trap_species_store_density-ci_losses_pixel_species_storeA
+     trap_species_storeB_density = trap_species_store_density-ci_losses_pixel_species_storeB
+  endif else begin
+    trap_species_storeA_density = trap_species_store_density
+    trap_species_storeB_density = trap_species_store_density
+  endelse
 
   ;;; Initialise arrays to store the 3x3 binned input and damaged pixels energies.
   list_energy_grid = dblarr(9, xraysTot)
@@ -1371,7 +1484,7 @@ pro distort_cdm_fits, fits_filename, key_release = key_release, key_plot = key_p
      endif
      
      ;;; Apply CDM function
-     cdm_damaged_3x3_ev = cdm_function(xray_unbinned_18cols, tab[event_index].RAWX, tab[event_index].RAWY, transfer_length, readout_image_time, readout_store_time, readout_serial_time, trap_species_parallel, trap_species_image_density, trap_species_store_density, trap_species_serial, trap_species_serial_density, charge_injection_flag, charge_injection_time_gap, store_section_lines, ci_losses_pixel_species_image, release_image_time, release_store_time, release_serial_time, ci_released_image_pixel, capture_cross_section_image, charge_volume_coeff_image, capture_cross_section_store, charge_volume_coeff_store, capture_cross_section_serial, charge_volume_coeff_serial,  flag_retrapping, flag_iteration, iter_max, threshold,  short_bernoulli, long_bernoulli, flag_binomial, max(tab.RAWY), serialL, readout_nodes, serial_columns, ci_losses_pixel_species_store)
+     cdm_damaged_3x3_ev = cdm_function(xray_unbinned_18cols, tab[event_index].RAWX, tab[event_index].RAWY, transfer_length, readout_image_time, readout_store_time, readout_serial_time, trap_species_parallel, trap_species_image_density, trap_species_storeA_density, trap_species_storeB_density, trap_species_serial, trap_species_serial_density, charge_injection_flag, charge_injection_time_gap, image_section_lines, store_section_lines, ccd_mode_binning, ci_losses_pixel_species_image, release_image_time, release_store_time, release_serial_time, ci_released_image_pixel, capture_cross_section_image, charge_volume_coeff_image, capture_cross_section_store, charge_volume_coeff_store, capture_cross_section_serial, charge_volume_coeff_serial,  flag_retrapping, flag_iteration, iter_max, threshold,  short_bernoulli, long_bernoulli, flag_binomial, flag_same_pixel_release, max(tab.RAWY), serialL, readout_nodes, serial_columns, ci_losses_pixel_species_storeA, ci_losses_pixel_species_storeB)
 
      ;;; Store damaged 3x3 in list
      list_energy_grid_cdm_ev[*, event_index] = cdm_damaged_3x3_ev
